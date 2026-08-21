@@ -8,6 +8,9 @@ program generatesdf
     use spatial_hash_mod, only : build_hash, free_hash
     use fast_sweep_mod,   only : fast_sweep_3d
     use mpi
+#ifdef GPU_SDF
+    use openacc
+#endif
 
     implicit none
 
@@ -33,16 +36,31 @@ program generatesdf
     !  timing 
     real(dp) :: startTime, endTime, totalTime, time1, time2
 
-    !  misc 
+    !  misc
     integer :: ii
     logical :: debug = .false.
     character(len=4) :: ext
+
+#ifdef GPU_SDF
+    !  multi-GPU device binding
+    integer :: node_comm, node_rank, num_gpus
+#endif
 
     ! MPI init and domain decomposition
     call MPI_INIT(ierror)
     call MPI_COMM_SIZE(MPI_COMM_WORLD, nprocs, ierror)
     call MPI_COMM_RANK(MPI_COMM_WORLD, myid,   ierror)
     allocate(decomp_x_start(0:nprocs-1), decomp_x_end(0:nprocs-1), decomp_size(0:nprocs-1))
+
+#ifdef GPU_SDF
+    ! One GPU per rank (node-local rank mod GPU count)
+    call MPI_COMM_SPLIT_TYPE(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, node_comm, ierror)
+    call MPI_COMM_RANK(node_comm, node_rank, ierror)
+    num_gpus = acc_get_num_devices(acc_device_nvidia)
+    if (num_gpus < 1) error stop "GPU_SDF: no NVIDIA GPU visible to this rank"
+    call acc_set_device_num(mod(node_rank, num_gpus), acc_device_nvidia)
+    call MPI_COMM_FREE(node_comm, ierror)
+#endif
 
     if (myid == 0) then
         startTime = 0.0_dp
@@ -53,9 +71,17 @@ program generatesdf
     call MPI_BARRIER(MPI_COMM_WORLD, ierror)
 
     call read_inputfile(myid)
+#ifdef GPU_SDF
+    !$acc update device(scalarvalue)
+#endif
     call read_cans_grid(myid, 'data/', dp, ng, r0, non_uniform_grid, xp, yp, zp, xf, yf, zf, dz, lx, ly, lz)
     allocate(dz_inverse(ng(3)))
     call setup_grid_spacing(myid, xf, yf, zf, ng(3), dx, dy, dz, dx_inverse, dy_inverse, dz_inverse)
+#ifdef GPU_SDF
+    ! dz is allocated via dummy-argument aliasing in read_cans_grid, so declare create's automatic on-allocate hook never fires for it.
+    !$acc enter data create(dz)
+    !$acc update device(dx, dy, dz)
+#endif
 
     ! Detect input format from file extension
     ii = len_trim(inputfilename)
@@ -67,6 +93,11 @@ program generatesdf
         call read_obj(myid, trim(inputfilename), vertices, normals, faces, face_normals, &
                       nvertices, nnormals, nfaces)
     end if
+
+#ifdef GPU_SDF
+    ! Geometry is read-only and reused unchanged across the p/u/v/w passes below.
+    !$acc enter data copyin(vertices, normals, faces, face_normals)
+#endif
 
     call getbbox(myid, vertices, nvertices, bbox_min, bbox_max)
     call tagminmax(myid, xf, yp, zp, bbox_min, bbox_max, nx, ny, nz, dx, dy, dz(2), buffer_points, &

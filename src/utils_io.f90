@@ -34,8 +34,13 @@ module utils_io
     !  MPI 
     integer :: nprocs
 
-    !  Auxiliary 
+    !  Auxiliary
     integer, protected :: pbarwidth
+
+    !$acc declare create(dx, dy, scalarvalue)
+    ! dz is referenced inside godunov_update_cell (!$acc routine seq), which requires
+    ! module allocatables it touches to be declared, not just enter-data'd.
+    !$acc declare create(dz)
 
 contains
 
@@ -243,6 +248,7 @@ contains
         real(dp) :: verx, very, verz, normx, normy, normz
         integer  :: verind1, verind2, verind3, vn1, vn2, vn3
         real(dp), allocatable :: tmp_row(:)
+        integer,  allocatable :: tmp_irow(:)
 
         open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
         if (ios /= 0) then
@@ -299,6 +305,11 @@ contains
             allocate(tmp_row(num_normals))
             tmp_row = normals(2,:); normals(2,:) = normals(3,:); normals(3,:) = tmp_row
             deallocate(tmp_row)
+            ! y<->z is a reflection (det=-1): reverse winding so cross-product normals stay outward
+            allocate(tmp_irow(num_faces))
+            tmp_irow = faces(2,:); faces(2,:) = faces(3,:); faces(3,:) = tmp_irow
+            tmp_irow = face_normals(2,:); face_normals(2,:) = face_normals(3,:); face_normals(3,:) = tmp_irow
+            deallocate(tmp_irow)
         end if
 
         if (procid == 0) then
@@ -342,6 +353,7 @@ contains
         integer(2)         :: attr
         real(4)            :: fn(3), v0(3), v1(3), v2(3)  ! float32 reads
         real(dp), allocatable :: tmp_row(:)
+        integer,  allocatable :: tmp_irow(:)
 
         open(newunit=unit, file=trim(filename), access='stream', form='unformatted', &
              status='old', action='read', iostat=ios)
@@ -389,6 +401,10 @@ contains
             allocate(tmp_row(num_normals))
             tmp_row = normals(2,:); normals(2,:) = normals(3,:); normals(3,:) = tmp_row
             deallocate(tmp_row)
+            ! y<->z is a reflection (det=-1): reverse winding so cross-product normals stay outward
+            allocate(tmp_irow(num_faces))
+            tmp_irow = faces(2,:); faces(2,:) = faces(3,:); faces(3,:) = tmp_irow
+            deallocate(tmp_irow)
         end if
 
         if (procid == 0) then

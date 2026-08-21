@@ -20,6 +20,7 @@ contains
     !  Godunov upwind solution of |Grad phi| = 1 at a single cell.
     ! 
     pure function solve_eikonal(phix, phiy, phiz, hx, hy, hz) result(phi_new)
+        !$acc routine seq
         implicit none
         real(dp), intent(in) :: phix, phiy, phiz, hx, hy, hz
         real(dp) :: phi_new
@@ -90,10 +91,66 @@ contains
         end if
     end function solve_eikonal
 
-    ! 
+    !  Single-cell Godunov update, shared by the CPU and GPU sweep drivers.
+    subroutine godunov_update_cell(sdf, xstart, xend, ny_loc, nz_loc, ii, jj, kk, &
+                                    ghost_left, ghost_right)
+        !$acc routine seq
+        implicit none
+        integer,  intent(in)    :: xstart, xend, ny_loc, nz_loc, ii, jj, kk
+        real(dp), intent(inout) :: sdf(xstart:xend, ny_loc, nz_loc)
+        real(dp), intent(in)    :: ghost_left(ny_loc, nz_loc)   ! ghost col at xstart-1
+        real(dp), intent(in)    :: ghost_right(ny_loc, nz_loc)  ! ghost col at xend+1
+        real(dp) :: phix, phiy, phiz, phi_try, hx, hy, hz
+
+        ! Skip cells already initialised by narrow-band phase (seeded |phi| << scalarvalue sentinel).
+        if (abs(sdf(ii,jj,kk)) < scalarvalue * 0.5_dp) return
+
+        hx = dx           ! uniform in x (xf array assumed uniform in this tool)
+        hy = dy
+        hz = dz(kk)       ! may be non-uniform
+
+        ! Upwind neighbours in x: use ghost planes at slab boundaries
+        if (ii == xstart) then
+            phix = merge(ghost_left(jj,kk), sdf(ii+1,jj,kk), &
+                         abs(ghost_left(jj,kk)) <= abs(sdf(ii+1,jj,kk)))
+        else if (ii == xend) then
+            phix = merge(sdf(ii-1,jj,kk), ghost_right(jj,kk), &
+                         abs(sdf(ii-1,jj,kk)) <= abs(ghost_right(jj,kk)))
+        else
+            phix = merge(sdf(ii-1,jj,kk), sdf(ii+1,jj,kk), &
+                         abs(sdf(ii-1,jj,kk)) <= abs(sdf(ii+1,jj,kk)))
+        end if
+
+        ! Upwind neighbours in y (local j index)
+        if (jj == 1) then
+            phiy = sdf(ii, 2, kk)
+        else if (jj == ny_loc) then
+            phiy = sdf(ii, ny_loc-1, kk)
+        else
+            phiy = merge(sdf(ii,jj-1,kk), sdf(ii,jj+1,kk), &
+                         abs(sdf(ii,jj-1,kk)) <= abs(sdf(ii,jj+1,kk)))
+        end if
+
+        ! Upwind neighbours in z (local k index)
+        if (kk == 1) then
+            phiz = sdf(ii, jj, 2)
+        else if (kk == nz_loc) then
+            phiz = sdf(ii, jj, nz_loc-1)
+        else
+            phiz = merge(sdf(ii,jj,kk-1), sdf(ii,jj,kk+1), &
+                         abs(sdf(ii,jj,kk-1)) <= abs(sdf(ii,jj,kk+1)))
+        end if
+
+        ! Sign of current cell (set by fill_internal) keeps exterior/interior signs during FSM propagation.
+        phi_try = solve_eikonal(abs(phix), abs(phiy), abs(phiz), hx, hy, hz) &
+                  * sign(1.0_dp, sdf(ii,jj,kk))
+        if (abs(phi_try) < abs(sdf(ii,jj,kk))) sdf(ii,jj,kk) = phi_try
+    end subroutine godunov_update_cell
+
+    !
     !  One complete Godunov FSM sweep in the directions dictated by sx/sy/sz
     !  (each ±1, giving 8 combinations).
-    ! 
+    !
     subroutine do_sweep(sdf, xstart, xend, ystart, yend, zstart, zend, &
                         sx_dir, sy_dir, sz_dir, xin, yin, zin, &
                         ghost_left, ghost_right)
@@ -107,7 +164,6 @@ contains
 
         integer  :: ii, jj, kk, i_lo, i_hi, i_step
         integer  :: j_lo, j_hi, j_step, k_lo, k_hi, k_step
-        real(dp) :: phix, phiy, phiz, phi_try, hx, hy, hz
         integer  :: nx_loc, ny_loc, nz_loc
 
         nx_loc = xend - xstart + 1
@@ -123,64 +179,61 @@ contains
         else;                  k_lo = nz_loc;  k_hi = 1;     k_step = -1; end if
 
         do ii = i_lo, i_hi, i_step
-            hx = dx   ! uniform in x (xf array assumed uniform in this tool)
             do jj = j_lo, j_hi, j_step
-                hy = dy
                 do kk = k_lo, k_hi, k_step
-                    hz = dz(kk)   ! may be non-uniform
-
-                    ! Skip cells already initialised by narrow-band phase.
-                    ! scalarvalue is the initial sentinel (large positive);
-                    ! seeded cells have |phi| << scalarvalue.
-                    if (abs(sdf(ii,jj,kk)) < scalarvalue * 0.5_dp) cycle
-
-                    ! Upwind neighbours in x: use ghost planes at slab boundaries
-                    if (ii == xstart) then
-                        phix = merge(ghost_left(jj,kk), sdf(ii+1,jj,kk), &
-                                     abs(ghost_left(jj,kk)) <= abs(sdf(ii+1,jj,kk)))
-                    else if (ii == xend) then
-                        phix = merge(sdf(ii-1,jj,kk), ghost_right(jj,kk), &
-                                     abs(sdf(ii-1,jj,kk)) <= abs(ghost_right(jj,kk)))
-                    else
-                        phix = merge(sdf(ii-1,jj,kk), sdf(ii+1,jj,kk), &
-                                     abs(sdf(ii-1,jj,kk)) <= abs(sdf(ii+1,jj,kk)))
-                    end if
-
-                    ! Upwind neighbours in y (local j index)
-                    if (jj == 1) then
-                        phiy = sdf(ii, 2, kk)
-                    else if (jj == ny_loc) then
-                        phiy = sdf(ii, ny_loc-1, kk)
-                    else
-                        phiy = merge(sdf(ii,jj-1,kk), sdf(ii,jj+1,kk), &
-                                     abs(sdf(ii,jj-1,kk)) <= abs(sdf(ii,jj+1,kk)))
-                    end if
-
-                    ! Upwind neighbours in z (local k index)
-                    if (kk == 1) then
-                        phiz = sdf(ii, jj, 2)
-                    else if (kk == nz_loc) then
-                        phiz = sdf(ii, jj, nz_loc-1)
-                    else
-                        phiz = merge(sdf(ii,jj,kk-1), sdf(ii,jj,kk+1), &
-                                     abs(sdf(ii,jj,kk-1)) <= abs(sdf(ii,jj,kk+1)))
-                    end if
-
-                    ! Use sign of current cell (set by fill_internal) to ensure
-                    ! exterior (+scalarvalue) cells stay positive and interior
-                    ! (-scalarvalue) cells stay negative during FSM propagation.
-                    phi_try = solve_eikonal(abs(phix), abs(phiy), abs(phiz), hx, hy, hz) &
-                              * sign(1.0_dp, sdf(ii,jj,kk))
-                    if (abs(phi_try) < abs(sdf(ii,jj,kk))) sdf(ii,jj,kk) = phi_try
+                    call godunov_update_cell(sdf, xstart, xend, ny_loc, nz_loc, ii, jj, kk, &
+                                              ghost_left, ghost_right)
                 end do
             end do
         end do
     end subroutine do_sweep
 
-    ! 
+#ifdef GPU_SDF
+    !  GPU diagonal-wavefront reformulation of do_sweep (same dependency structure, reordered — see docs/external-lib-guidance/GenSDF_GPU_porting.md).
+    subroutine do_sweep_wavefront_gpu(sdf, xstart, xend, ystart, yend, zstart, zend, &
+                                       sx_dir, sy_dir, sz_dir, xin, yin, zin, &
+                                       ghost_left, ghost_right)
+        implicit none
+        integer,  intent(in)    :: xstart, xend, ystart, yend, zstart, zend
+        integer,  intent(in)    :: sx_dir, sy_dir, sz_dir
+        real(dp), intent(in)    :: xin(:), yin(:), zin(:)
+        real(dp), intent(inout) :: sdf(xstart:xend, 1:size(yin), 1:size(zin))
+        real(dp), intent(in)    :: ghost_left(size(yin), size(zin))
+        real(dp), intent(in)    :: ghost_right(size(yin), size(zin))
+
+        integer :: nx_loc, ny_loc, nz_loc, level, level_max
+        integer :: ip, jp, kp, ii, jj, kk
+
+        nx_loc = xend - xstart + 1
+        ny_loc = size(yin)
+        nz_loc = size(zin)
+        level_max = nx_loc + ny_loc + nz_loc
+
+        do level = 3, level_max
+            !$acc parallel loop collapse(2) default(none) &
+            !$acc    private(ip, jp, kp, ii, jj, kk) &
+            !$acc    present(sdf, ghost_left, ghost_right) &
+            !$acc    firstprivate(level, nx_loc, ny_loc, nz_loc, xstart, xend, sx_dir, sy_dir, sz_dir)
+            do jp = 1, ny_loc
+                do ip = 1, nx_loc
+                    kp = level - ip - jp
+                    if (kp >= 1 .and. kp <= nz_loc) then
+                        if (sx_dir > 0) then; ii = xstart + (ip-1); else; ii = xend - (ip-1);   end if
+                        if (sy_dir > 0) then; jj = 1 + (jp-1);      else; jj = ny_loc - (jp-1); end if
+                        if (sz_dir > 0) then; kk = 1 + (kp-1);      else; kk = nz_loc - (kp-1); end if
+                        call godunov_update_cell(sdf, xstart, xend, ny_loc, nz_loc, ii, jj, kk, &
+                                                  ghost_left, ghost_right)
+                    end if
+                end do
+            end do
+        end do
+    end subroutine do_sweep_wavefront_gpu
+#endif
+
+    !
     !  Exchange a single yz ghost plane with a neighbour rank via MPI_SENDRECV.
-    !  direction:  +1 → send right face (ii=xend),   fill ghost_out with right-neighbour data
-    !              -1 → send left  face (ii=xstart),  fill ghost_out with left-neighbour data
+    !  direction:  +1 - send right face (ii=xend),   fill ghost_out with right-neighbour data
+    !              -1 - send left  face (ii=xstart),  fill ghost_out with left-neighbour data
     ! 
     subroutine exchange_ghost_plane(sdf, xstart, xend, ny_loc, nz_loc, &
                                     direction, myid, neighbour, &
@@ -248,10 +301,16 @@ contains
             if (allocated(ghost_right_mod)) deallocate(ghost_right_mod)
             allocate(send_buf_mod(ny_loc, nz_loc))
             allocate(ghost_left_mod(ny_loc, nz_loc), ghost_right_mod(ny_loc, nz_loc))
+#ifdef GPU_SDF
+            !$acc enter data create(ghost_left_mod, ghost_right_mod)
+#endif
         end if
         ghost_left_mod  = INF_D
         ghost_right_mod = INF_D
 
+#ifdef GPU_SDF
+        !$acc data copy(sdf)
+#endif
         ! 8 sweeps: all combinations of ±x, ±y, ±z.
         ! Each sweep processes cells in a fixed order along each axis, propagating
         ! the distance wave the full domain length in one pass per direction.
@@ -262,15 +321,28 @@ contains
             sy_dir = merge( 1, -1, iand(sw, 2) == 0 )
             sz_dir = merge( 1, -1, iand(sw, 4) == 0 )
 
+#ifdef GPU_SDF
+            ! Only the two boundary planes are needed on the host side for MPI.
+            !$acc update host(sdf(xstart:xstart,:,:), sdf(xend:xend,:,:))
+#endif
             ! Exchange ghost planes so boundary stencils use fresh neighbour data.
             call exchange_ghost_plane(sdf, xstart, xend, ny_loc, nz_loc, &
                                        -1, myid, left_rank,  send_buf_mod, ghost_left_mod,  ierror)
             call exchange_ghost_plane(sdf, xstart, xend, ny_loc, nz_loc, &
                                        +1, myid, right_rank, send_buf_mod, ghost_right_mod, ierror)
 
+#ifdef GPU_SDF
+            !$acc update device(ghost_left_mod, ghost_right_mod)
+            call do_sweep_wavefront_gpu(sdf, xstart, xend, ystart, yend, zstart, zend, &
+                          sx_dir, sy_dir, sz_dir, xin, yin, zin, ghost_left_mod, ghost_right_mod)
+#else
             call do_sweep(sdf, xstart, xend, ystart, yend, zstart, zend, &
                           sx_dir, sy_dir, sz_dir, xin, yin, zin, ghost_left_mod, ghost_right_mod)
+#endif
         end do
+#ifdef GPU_SDF
+        !$acc end data
+#endif
 
     end subroutine fast_sweep_3d
 

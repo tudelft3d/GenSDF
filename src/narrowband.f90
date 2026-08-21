@@ -3,13 +3,18 @@ module narrowband_mod
     ! narrowband_mod — triangle distance primitives and SDF computation.
     !
     use utils_io
+#ifdef GPU_SDF
+    use spatial_hash_mod, only : query_hash, max_cell_count, query_hash_gpu, max_cands_gpu
+#else
     use spatial_hash_mod, only : query_hash, max_cell_count
+#endif
     implicit none
 
 contains
 
     ! -----------------------------------------------------------------------
     subroutine cross_product(res, u, v)
+        !$acc routine seq
         implicit none
         real(dp), dimension(3), intent(in)  :: u, v
         real(dp), dimension(3), intent(out) :: res
@@ -20,6 +25,7 @@ contains
 
     ! -----------------------------------------------------------------------
     subroutine project_point_to_triangle(point, vert0, vert1, vert2, param_s, param_t)
+        !$acc routine seq
         !
         ! Closest-point projection of point onto the triangle (vert0, vert1, vert2).
         ! Uses Ericson's 7-region algorithm (Real-Time Collision Detection §5.1.5),
@@ -108,6 +114,7 @@ contains
         ! Signed distance from point to nearest point on triangle.
         ! Sign determined by dot product with the effective outward normal (positive = outside).
         !
+        !$acc routine seq
         implicit none
         real(dp), intent(in)  :: point(3), vert0(3), vert1(3), vert2(3), avg_normal(3)
         real(dp), intent(out) :: dist_to_face
@@ -162,8 +169,9 @@ contains
         real(dp) :: norm_1(3), norm_2(3), norm_3(3)
         real(dp) :: min_query(3), max_query(3), query_point(3)
         integer  :: min_index(3), max_index(3)
+        integer  :: ii_lo, ii_hi, jj_lo, jj_hi, kk_lo, kk_hi
         real(dp) :: avg_normal(3), avg_normal_mag_inv
-        real(dp) :: temp_distance, temp_value(2)
+        real(dp) :: temp_distance
         real(dp) :: deltax_inverse, deltay_inverse, stime
         integer  :: printrank
 
@@ -172,6 +180,10 @@ contains
         deltax_inverse = 1.0_dp / dx
         deltay_inverse = 1.0_dp / dy
 
+#ifdef GPU_SDF
+        !$acc data copy(distance) copyin(xin, yin, zin) &
+        !$acc      present(input_vertices, input_normals, input_faces, input_face_normals)
+#endif
         do face_id = 1, nfaces
             if (procid == printrank) call show_progress(face_id, nfaces, pbarwidth, stime)
             vertex_1 = input_vertices(:, input_faces(1,face_id))
@@ -205,23 +217,36 @@ contains
             max_index(2) = floor((max_query(2) - yin(1) + 0.5_dp*dy) * deltay_inverse) + 1 + buffer_point_size
             min_index(3) = max(bsearch_le(zin, min_query(3), zstart, zend) - buffer_point_size, zstart)
             max_index(3) = min(bsearch_le(zin, max_query(3), zstart, zend) + buffer_point_size, zend)
+            ii_lo = min_index(1); ii_hi = max_index(1)
+            jj_lo = min_index(2); jj_hi = max_index(2)
+            kk_lo = min_index(3); kk_hi = max_index(3)
 
-            do kk = min_index(3), max_index(3)
-                do jj = min_index(2), max_index(2)
-                    do ii = min_index(1), max_index(1)
+#ifdef GPU_SDF
+            ! Scalar loop bounds, not array elements — nvfortran mishandles firstprivate arrays used as collapsed loop bounds.
+            !$acc parallel loop collapse(3) &
+            !$acc    private(query_point, temp_distance) &
+            !$acc    firstprivate(vertex_1, vertex_2, vertex_3, avg_normal, ii_lo, ii_hi, jj_lo, jj_hi, kk_lo, kk_hi) &
+            !$acc    present(xin, yin, zin, distance)
+#endif
+            do kk = kk_lo, kk_hi
+                do jj = jj_lo, jj_hi
+                    do ii = ii_lo, ii_hi
                         if (ii>=xstart .and. ii<=xend .and. &
                             jj>=ystart .and. jj<=yend .and. &
                             kk>=zstart .and. kk<=zend) then
                             query_point = [xin(ii), yin(jj), zin(kk)]
                             call distance_point_to_triangle(query_point, vertex_1, vertex_2, vertex_3, &
                                                              avg_normal, temp_distance)
-                            temp_value = [temp_distance, distance(ii,jj,kk)]
-                            distance(ii,jj,kk) = temp_value(minloc(abs(temp_value), dim=1))
+                            ! Equivalent to minloc(abs([temp_distance,distance])) — nvfortran mislowers minloc in this kernel.
+                            if (abs(temp_distance) < abs(distance(ii,jj,kk))) distance(ii,jj,kk) = temp_distance
                         end if
                     end do
                 end do
             end do
         end do
+#ifdef GPU_SDF
+        !$acc end data
+#endif
     end subroutine compute_scalar_distance_face
 
     ! -----------------------------------------------------------------------
@@ -243,7 +268,11 @@ contains
         real(dp), intent(out) :: distance(xstart:xend, 1:size(yin), 1:size(zin))
 
         integer  :: ii, jj, kk, fc, fid, n_cand
+#ifdef GPU_SDF
+        integer  :: cands(max_cands_gpu)
+#else
         integer, allocatable :: cands(:)
+#endif
         real(dp) :: query_point(3)
         real(dp) :: v1(3), v2(3), v3(3)
         real(dp) :: n1(3), n2(3), n3(3), avg_n(3), avg_n_inv
@@ -260,6 +289,52 @@ contains
         ! Narrow-band distance estimate: nbw cells * max grid spacing
         nbw_dist = real(nbw, dp) * max(dx, dy, maxval(dz))
 
+#ifdef GPU_SDF
+        !$acc data copyin(xin, yin, zin) copy(distance) &
+        !$acc      present(input_vertices, input_normals, input_faces, input_face_normals)
+        !$acc parallel loop collapse(3) &
+        !$acc    private(query_point, v1, v2, v3, n1, n2, n3, avg_n, avg_n_inv, d_try, best_d, &
+        !$acc            fc, fid, n_cand, cands) default(none) &
+        !$acc    present(xin, yin, zin, distance, input_vertices, input_normals, input_faces, input_face_normals) &
+        !$acc    firstprivate(nbw_dist)
+        do kk = zstart, zend
+            do jj = ystart, yend
+                do ii = xstart, xend
+                    query_point = [xin(ii), yin(jj), zin(kk)]
+                    call query_hash_gpu(query_point, cands, n_cand)
+
+                    best_d = scalarvalue
+                    do fc = 1, n_cand
+                        fid = cands(fc)
+                        v1 = input_vertices(:, input_faces(1,fid))
+                        v2 = input_vertices(:, input_faces(2,fid))
+                        v3 = input_vertices(:, input_faces(3,fid))
+                        n1 = input_normals(:, input_face_normals(1,fid))
+                        n2 = input_normals(:, input_face_normals(2,fid))
+                        n3 = input_normals(:, input_face_normals(3,fid))
+                        avg_n     = n1 + n2 + n3
+                        if (dot_product(avg_n, avg_n) > 1.0e-30_dp) then
+                            avg_n_inv = 1.0_dp / sqrt(dot_product(avg_n, avg_n))
+                            avg_n     = avg_n * avg_n_inv
+                        else
+                            ! Normals cancel at sharp crease: fall back to geometric (winding) normal
+                            avg_n(1) = (v2(2)-v1(2))*(v3(3)-v1(3)) - (v2(3)-v1(3))*(v3(2)-v1(2))
+                            avg_n(2) = (v2(3)-v1(3))*(v3(1)-v1(1)) - (v2(1)-v1(1))*(v3(3)-v1(3))
+                            avg_n(3) = (v2(1)-v1(1))*(v3(2)-v1(2)) - (v2(2)-v1(2))*(v3(1)-v1(1))
+                            avg_n_inv = 1.0_dp / sqrt(dot_product(avg_n, avg_n))
+                            avg_n     = avg_n * avg_n_inv
+                        end if
+                        call distance_point_to_triangle(query_point, v1, v2, v3, avg_n, d_try)
+                        if (abs(d_try) < abs(best_d)) best_d = d_try
+                    end do
+
+                    ! Accept only cells inside the narrow band.
+                    if (abs(best_d) < nbw_dist) distance(ii, jj, kk) = best_d
+                end do
+            end do
+        end do
+        !$acc end data
+#else
         ! Pre-allocate candidate buffer once (27 hash-cell neighbourhood max)
         allocate(cands(27 * max(1, max_cell_count)))
 
@@ -303,6 +378,7 @@ contains
             end do
         end do
         deallocate(cands)
+#endif
     end subroutine compute_narrowband_sdf
 
     ! -----------------------------------------------------------------------

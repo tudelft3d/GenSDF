@@ -23,20 +23,29 @@ module spatial_hash_mod
     ! Number of faces stored in the hash (set by build_hash)
     integer :: nfaces_hash
 
+    ! Per-thread GPU query_hash candidate buffer capacity
+    integer, parameter :: max_cands_gpu = 32768
+
+    !$acc declare create(hcells, h_origin, h_size, total_hcells)
+    ! csr_offset/csr_triid are used inside query_hash_gpu (!$acc routine seq), so must be declared, not just enter-data'd.
+    !$acc declare create(csr_offset, csr_triid)
+
 contains
 
-    ! 
+    !
     !  Inline helper: flat index of hash cell (hx,hy,hz)  (1-based)
-    ! 
+    !
     pure integer function cell_flat(hx, hy, hz)
+        !$acc routine seq
         integer, intent(in) :: hx, hy, hz
         cell_flat = (hx-1)*hcells(2)*hcells(3) + (hy-1)*hcells(3) + hz
     end function cell_flat
 
-    ! 
+    !
     !  Hash cell index for a world coordinate (clipped to valid range)
-    ! 
+    !
     pure integer function hash_ix(coord, dim)
+        !$acc routine seq
         real(dp), intent(in) :: coord
         integer,  intent(in) :: dim
         hash_ix = max(1, min(hcells(dim), int((coord - h_origin(dim)) / h_size(dim)) + 1))
@@ -134,8 +143,15 @@ contains
         end do
 
         deallocate(count, cursor, tri_aabbs)
+
+#ifdef GPU_SDF
+        if (27 * max_cell_count > max_cands_gpu) &
+            error stop "GPU_SDF: hash cell too dense, raise max_cands_gpu (spatial_hash.f90)"
+        !$acc update device(hcells, h_origin, h_size, total_hcells)
+        !$acc update device(csr_offset, csr_triid)
+#endif
     end subroutine build_hash
- 
+
     subroutine query_hash(pt, candidate_tris, n_candidates)
         !
         ! Return all triangle IDs in the 3x3x3 neighbourhood of hash cells around pt.
@@ -170,7 +186,40 @@ contains
         n_candidates = n_tmp
     end subroutine query_hash
 
-    ! 
+#ifdef GPU_SDF
+    !  Device-callable query_hash: fixed-capacity dummy array, private per GPU thread.
+    subroutine query_hash_gpu(pt, candidate_tris, n_candidates)
+        !$acc routine seq
+        implicit none
+        real(dp), intent(in)  :: pt(3)
+        integer,  intent(out) :: candidate_tris(max_cands_gpu)
+        integer,  intent(out) :: n_candidates
+        integer :: hx, hy, hz, cx, cy, cz, cflat, lo, hi, kk
+        integer :: n_tmp
+
+        hx = hash_ix(pt(1), 1)
+        hy = hash_ix(pt(2), 2)
+        hz = hash_ix(pt(3), 3)
+
+        n_tmp = 0
+        do cx = max(1, hx-1), min(hcells(1), hx+1)
+            do cy = max(1, hy-1), min(hcells(2), hy+1)
+                do cz = max(1, hz-1), min(hcells(3), hz+1)
+                    cflat = cell_flat(cx, cy, cz)
+                    lo = csr_offset(cflat)
+                    hi = csr_offset(cflat+1) - 1
+                    do kk = lo, hi
+                        n_tmp = n_tmp + 1
+                        candidate_tris(n_tmp) = csr_triid(kk)
+                    end do
+                end do
+            end do
+        end do
+        n_candidates = n_tmp
+    end subroutine query_hash_gpu
+#endif
+
+    !
     subroutine free_hash()
         if (allocated(csr_offset)) deallocate(csr_offset)
         if (allocated(csr_triid))  deallocate(csr_triid)
