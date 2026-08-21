@@ -1,8 +1,16 @@
 FC        = mpif90
-FFLAGS    = -O3 -ffree-line-length-none -cpp
-FFLAGS_DBG= -O0 -g -fbounds-check -ffree-line-length-none -cpp	#Bounds check only in debug mode 
+GPU       = 0
+FFLAGS_DBG= -O0 -g -fbounds-check -ffree-line-length-none -cpp	#Bounds check only in debug mode
 LDFLAGS   =
 EXE     = gensdf
+
+ifeq ($(GPU),1)
+    # nvfortran: no -ffree-line-length-none (gfortran-only flag, nvfortran has no line-length cap)
+    FFLAGS  = -O3 -cpp -acc -gpu=cc86,rdc -Minfo=accel -DGPU_SDF
+    LDFLAGS = -acc -gpu=cc86,rdc
+else
+    FFLAGS = -O3 -ffree-line-length-none -cpp
+endif
 
 # Compilation order respects Fortran module dependencies:
 #   utils_io      -> flood_fill, spatial_hash, fast_sweep

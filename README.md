@@ -18,6 +18,13 @@ cd src
 make FFLAGS="-O0 -g -fbounds-check -ffree-line-length-none -cpp"
 ```
 
+### GPU build (OpenACC / NVHPC)
+```
+cd src
+make GPU=1 FC=/path/to/nvhpc/comm_libs/openmpi4/openmpi-4.0.5/bin/mpif90
+```
+Requires the NVHPC SDK (`nvfortran` on `PATH`) and its MPI wrapper. Targets `cc86` by default (`-acc -gpu=cc86,rdc`); edit `GPU=1`'s `FFLAGS`/`LDFLAGS` in `src/Makefile` for a different compute capability. `GPU=0` (default) is unaffected. See `docs/gpu_build.md` for what the port covers and how it was validated.
+
 ## How to change parameters
 Edit `parameters.in` following the format described in `docs/input_parameters.md`. Comment lines begin with `#`.
 
