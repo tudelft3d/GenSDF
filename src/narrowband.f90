@@ -152,7 +152,8 @@ contains
     ! -----------------------------------------------------------------------
     subroutine compute_scalar_distance_face(procid, xstart, xend, ystart, yend, zstart, zend, &
                                              xin, yin, zin, nfaces, input_faces, input_face_normals, &
-                                             input_vertices, input_normals, buffer_point_size, distance)
+                                             input_vertices, input_normals, input_face_solid_id, &
+                                             buffer_point_size, distance, solid_id)
         !
         ! Original O(Nf × buffer^3) brute-force distance loop.
         !
@@ -163,8 +164,11 @@ contains
         integer,  intent(in)  :: nfaces, buffer_point_size
         real(dp), intent(in),  dimension(:,:) :: input_vertices, input_normals
         integer,  intent(in),  dimension(:,:) :: input_faces, input_face_normals
+        integer,  intent(in),  dimension(:)   :: input_face_solid_id
         real(dp), intent(out) :: distance(xstart:xend, 1:size(yin), 1:size(zin))
+        real(dp), intent(out) :: solid_id(xstart:xend, 1:size(yin), 1:size(zin))
         integer  :: face_id, ii, jj, kk
+        real(dp) :: sid
         real(dp) :: vertex_1(3), vertex_2(3), vertex_3(3)
         real(dp) :: norm_1(3), norm_2(3), norm_3(3)
         real(dp) :: min_query(3), max_query(3), query_point(3)
@@ -181,11 +185,12 @@ contains
         deltay_inverse = 1.0_dp / dy
 
 #ifdef GPU_SDF
-        !$acc data copy(distance) copyin(xin, yin, zin) &
+        !$acc data copy(distance, solid_id) copyin(xin, yin, zin) &
         !$acc      present(input_vertices, input_normals, input_faces, input_face_normals)
 #endif
         do face_id = 1, nfaces
             if (procid == printrank) call show_progress(face_id, nfaces, pbarwidth, stime)
+            sid = real(input_face_solid_id(face_id), dp)
             vertex_1 = input_vertices(:, input_faces(1,face_id))
             vertex_2 = input_vertices(:, input_faces(2,face_id))
             vertex_3 = input_vertices(:, input_faces(3,face_id))
@@ -213,8 +218,13 @@ contains
             end do
             min_index(1) = floor((min_query(1) - xin(1) + 0.5_dp*dx) * deltax_inverse) + 1 - buffer_point_size
             max_index(1) = floor((max_query(1) - xin(1) + 0.5_dp*dx) * deltax_inverse) + 1 + buffer_point_size
-            min_index(2) = floor((min_query(2) - yin(1) + 0.5_dp*dy) * deltay_inverse) + 1 - buffer_point_size
-            max_index(2) = floor((max_query(2) - yin(1) + 0.5_dp*dy) * deltay_inverse) + 1 + buffer_point_size
+            if (y_stretched) then
+                min_index(2) = max(bsearch_le(yin, min_query(2), ystart, yend) - buffer_point_size, ystart)
+                max_index(2) = min(bsearch_le(yin, max_query(2), ystart, yend) + buffer_point_size, yend)
+            else
+                min_index(2) = floor((min_query(2) - yin(1) + 0.5_dp*dy) * deltay_inverse) + 1 - buffer_point_size
+                max_index(2) = floor((max_query(2) - yin(1) + 0.5_dp*dy) * deltay_inverse) + 1 + buffer_point_size
+            end if
             min_index(3) = max(bsearch_le(zin, min_query(3), zstart, zend) - buffer_point_size, zstart)
             max_index(3) = min(bsearch_le(zin, max_query(3), zstart, zend) + buffer_point_size, zend)
             ii_lo = min_index(1); ii_hi = max_index(1)
@@ -225,8 +235,8 @@ contains
             ! Scalar loop bounds, not array elements — nvfortran mishandles firstprivate arrays used as collapsed loop bounds.
             !$acc parallel loop collapse(3) &
             !$acc    private(query_point, temp_distance) &
-            !$acc    firstprivate(vertex_1, vertex_2, vertex_3, avg_normal, ii_lo, ii_hi, jj_lo, jj_hi, kk_lo, kk_hi) &
-            !$acc    present(xin, yin, zin, distance)
+            !$acc    firstprivate(vertex_1, vertex_2, vertex_3, avg_normal, ii_lo, ii_hi, jj_lo, jj_hi, kk_lo, kk_hi, sid) &
+            !$acc    present(xin, yin, zin, distance, solid_id)
 #endif
             do kk = kk_lo, kk_hi
                 do jj = jj_lo, jj_hi
@@ -238,7 +248,10 @@ contains
                             call distance_point_to_triangle(query_point, vertex_1, vertex_2, vertex_3, &
                                                              avg_normal, temp_distance)
                             ! Equivalent to minloc(abs([temp_distance,distance])) — nvfortran mislowers minloc in this kernel.
-                            if (abs(temp_distance) < abs(distance(ii,jj,kk))) distance(ii,jj,kk) = temp_distance
+                            if (abs(temp_distance) < abs(distance(ii,jj,kk))) then
+                               distance(ii,jj,kk) = temp_distance
+                               solid_id(ii,jj,kk) = sid
+                            end if
                         end if
                     end do
                 end do
@@ -252,22 +265,30 @@ contains
     ! -----------------------------------------------------------------------
     subroutine compute_narrowband_sdf(procid, xstart, xend, ystart, yend, zstart, zend, &
                                        xin, yin, zin, nfaces, input_faces, input_face_normals, &
-                                       input_vertices, input_normals, nbw, distance)
+                                       input_vertices, input_normals, input_face_solid_id, &
+                                       nbw, distance, solid_id)
         !
         ! Narrow-band SDF computation using the spatial hash for candidate triangle queries.
-        ! For each cell, we query the hash to get nearby triangles and compute the exact
-        ! point-to-triangle distance, accepting the result only if it's within the narrow band.
+        ! For each cell, we query the hash for nearby triangles and compute the exact
+        ! point-to-triangle distance, accepting the result whenever the hash finds a
+        ! candidate — NOT gated by a separate `nbw` distance threshold. A fixed physical
+        ! band width can be smaller than the true nearest-triangle distance at some nodes
+        ! of a small/thin solid (e.g. sub-cell roughness), leaving those nodes at the
+        ! sentinel value and creating avoidable gaps in the distance seeds.
         !
         use mpi, only : MPI_WTIME
         implicit none
         integer,  intent(in)  :: procid, xstart, xend, ystart, yend, zstart, zend
         real(dp), intent(in),  dimension(:) :: xin, yin, zin
-        integer,  intent(in)  :: nfaces, nbw
+        integer,  intent(in)  :: nfaces
+        integer,  intent(in)  :: nbw   ! unused: kept for call-site compatibility, see header comment
         real(dp), intent(in),  dimension(:,:) :: input_vertices, input_normals
         integer,  intent(in),  dimension(:,:) :: input_faces, input_face_normals
+        integer,  intent(in),  dimension(:)   :: input_face_solid_id
         real(dp), intent(out) :: distance(xstart:xend, 1:size(yin), 1:size(zin))
+        real(dp), intent(out) :: solid_id(xstart:xend, 1:size(yin), 1:size(zin))
 
-        integer  :: ii, jj, kk, fc, fid, n_cand
+        integer  :: ii, jj, kk, fc, fid, n_cand, best_fid
 #ifdef GPU_SDF
         integer  :: cands(max_cands_gpu)
 #else
@@ -276,34 +297,33 @@ contains
         real(dp) :: query_point(3)
         real(dp) :: v1(3), v2(3), v3(3)
         real(dp) :: n1(3), n2(3), n3(3), avg_n(3), avg_n_inv
-        real(dp) :: d_try, best_d, nbw_dist
+        real(dp) :: d_try, best_d
         real(dp) :: stime
         integer  :: printrank
 
         printrank = nprocs / 2
         stime     = MPI_WTIME()
 
-        ! Initialise all cells to scalarvalue (large positive = far fluid)
+        ! Initialise all cells to scalarvalue (large positive = far fluid); solid_id 0 = unset/far-field
         distance = scalarvalue
-
-        ! Narrow-band distance estimate: nbw cells * max grid spacing
-        nbw_dist = real(nbw, dp) * max(dx, dy, maxval(dz))
+        solid_id = 0.0_dp
 
 #ifdef GPU_SDF
-        !$acc data copyin(xin, yin, zin) copy(distance) &
-        !$acc      present(input_vertices, input_normals, input_faces, input_face_normals)
+        !$acc data copyin(xin, yin, zin) copy(distance, solid_id) &
+        !$acc      present(input_vertices, input_normals, input_faces, input_face_normals, input_face_solid_id)
         !$acc parallel loop collapse(3) &
-        !$acc    private(query_point, v1, v2, v3, n1, n2, n3, avg_n, avg_n_inv, d_try, best_d, &
+        !$acc    private(query_point, v1, v2, v3, n1, n2, n3, avg_n, avg_n_inv, d_try, best_d, best_fid, &
         !$acc            fc, fid, n_cand, cands) default(none) &
-        !$acc    present(xin, yin, zin, distance, input_vertices, input_normals, input_faces, input_face_normals) &
-        !$acc    firstprivate(nbw_dist)
+        !$acc    present(xin, yin, zin, distance, solid_id, input_vertices, input_normals, input_faces, &
+        !$acc            input_face_normals, input_face_solid_id)
         do kk = zstart, zend
             do jj = ystart, yend
                 do ii = xstart, xend
                     query_point = [xin(ii), yin(jj), zin(kk)]
                     call query_hash_gpu(query_point, cands, n_cand)
 
-                    best_d = scalarvalue
+                    best_d   = scalarvalue
+                    best_fid = 0
                     do fc = 1, n_cand
                         fid = cands(fc)
                         v1 = input_vertices(:, input_faces(1,fid))
@@ -325,11 +345,17 @@ contains
                             avg_n     = avg_n * avg_n_inv
                         end if
                         call distance_point_to_triangle(query_point, v1, v2, v3, avg_n, d_try)
-                        if (abs(d_try) < abs(best_d)) best_d = d_try
+                        if (abs(d_try) < abs(best_d)) then
+                           best_d   = d_try
+                           best_fid = fid
+                        end if
                     end do
 
-                    ! Accept only cells inside the narrow band.
-                    if (abs(best_d) < nbw_dist) distance(ii, jj, kk) = best_d
+                    ! Accept whenever the hash found a candidate triangle.
+                    if (best_fid > 0) then
+                       distance(ii, jj, kk) = best_d
+                       solid_id(ii, jj, kk) = real(input_face_solid_id(best_fid), dp)
+                    end if
                 end do
             end do
         end do
@@ -346,7 +372,8 @@ contains
                     query_point = [xin(ii), yin(jj), zin(kk)]
                     call query_hash(query_point, cands, n_cand)
 
-                    best_d = scalarvalue
+                    best_d   = scalarvalue
+                    best_fid = 0
                     do fc = 1, n_cand
                         fid = cands(fc)
                         v1 = input_vertices(:, input_faces(1,fid))
@@ -368,12 +395,18 @@ contains
                             avg_n     = avg_n * avg_n_inv
                         end if
                         call distance_point_to_triangle(query_point, v1, v2, v3, avg_n, d_try)
-                        if (abs(d_try) < abs(best_d)) best_d = d_try
+                        if (abs(d_try) < abs(best_d)) then
+                           best_d   = d_try
+                           best_fid = fid
+                        end if
                     end do
                     ! no deallocate — cands is pre-allocated across iterations
 
-                    ! Accept only cells inside the narrow band.
-                    if (abs(best_d) < nbw_dist) distance(ii, jj, kk) = best_d
+                    ! Accept whenever the hash found a candidate triangle.
+                    if (best_fid > 0) then
+                       distance(ii, jj, kk) = best_d
+                       solid_id(ii, jj, kk) = real(input_face_solid_id(best_fid), dp)
+                    end if
                 end do
             end do
         end do

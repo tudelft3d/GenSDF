@@ -106,7 +106,7 @@ contains
         if (abs(sdf(ii,jj,kk)) < scalarvalue * 0.5_dp) return
 
         hx = dx           ! uniform in x (xf array assumed uniform in this tool)
-        hy = dy
+        hy = dyv(jj)      ! per-cell (spanwise stretching); equals dy on a uniform grid
         hz = dz(kk)       ! may be non-uniform
 
         ! Upwind neighbours in x: use ghost planes at slab boundaries
@@ -141,7 +141,7 @@ contains
                          abs(sdf(ii,jj,kk-1)) <= abs(sdf(ii,jj,kk+1)))
         end if
 
-        ! Sign of current cell (set by fill_internal) keeps exterior/interior signs during FSM propagation.
+        ! Sign of current cell (set by ray-crossing classification) is preserved during FSM propagation.
         phi_try = solve_eikonal(abs(phix), abs(phiy), abs(phiz), hx, hy, hz) &
                   * sign(1.0_dp, sdf(ii,jj,kk))
         if (abs(phi_try) < abs(sdf(ii,jj,kk))) sdf(ii,jj,kk) = phi_try
@@ -232,8 +232,8 @@ contains
 
     !
     !  Exchange a single yz ghost plane with a neighbour rank via MPI_SENDRECV.
-    !  direction:  +1 - send right face (ii=xend),   fill ghost_out with right-neighbour data
-    !              -1 - send left  face (ii=xstart),  fill ghost_out with left-neighbour data
+    !  direction:  +1 → send right face (ii=xend),   fill ghost_out with right-neighbour data
+    !              -1 → send left  face (ii=xstart),  fill ghost_out with left-neighbour data
     ! 
     subroutine exchange_ghost_plane(sdf, xstart, xend, ny_loc, nz_loc, &
                                     direction, myid, neighbour, &
@@ -314,7 +314,7 @@ contains
         ! 8 sweeps: all combinations of ±x, ±y, ±z.
         ! Each sweep processes cells in a fixed order along each axis, propagating
         ! the distance wave the full domain length in one pass per direction.
-        ! With fill_internal providing correct ±scalarvalue sentinels, a single
+        ! With ray-crossing classification providing correct ±scalarvalue sentinels, a single
         ! round of 8 sweeps covers all octants.
         do sw = 0, 7
             sx_dir = merge( 1, -1, iand(sw, 1) == 0 )
@@ -347,4 +347,3 @@ contains
     end subroutine fast_sweep_3d
 
 end module fast_sweep_mod
-

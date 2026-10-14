@@ -19,6 +19,9 @@ module utils_io
     real(dp), allocatable, dimension(:) :: xp, yp, zp, xf, yf, zf
     real(dp) :: lx, ly, lz, dx, dy, dx_inverse, dy_inverse
     real(dp), allocatable, dimension(:) :: dz, dz_inverse
+    ! per-cell width along GenSDF's internal y (= solver z when vertical_axis==2); uniform unless data/grid_z.out is present
+    real(dp), allocatable, dimension(:) :: dyv
+    logical :: y_stretched = .false.
 
     !  SDF / algorithm control 
     real(dp), protected :: scalarvalue
@@ -41,6 +44,7 @@ module utils_io
     ! dz is referenced inside godunov_update_cell (!$acc routine seq), which requires
     ! module allocatables it touches to be declared, not just enter-data'd.
     !$acc declare create(dz)
+    !$acc declare create(dyv)
 
 contains
 
@@ -163,6 +167,8 @@ contains
         allocate(xin_p(npoints(1)), yin_p(npoints(2)), zin_p(npoints(3)))
         allocate(xin_f(npoints(1)), yin_f(npoints(2)), zin_f(npoints(3)))
         allocate(dzin(npoints(3)))
+        allocate(dyv(npoints(2)))
+        dyv = dl(2)
 
         do iter = 1, npoints(1)
             xin_p(iter) = origin(1) + (iter - 0.5_dp) * dl(1)
@@ -201,6 +207,30 @@ contains
                 close(unit)
                 zin_p = origin(3) + grid_z8(:,2)
                 zin_f = origin(3) + grid_z8(:,3)
+            end if
+        end if
+
+        ! Optional stretched spanwise grid (solver z, GenSDF's internal y when vertical_axis==2): same 5-column
+        ! format as grid.out, written by the solver's genGridandIC when alpha_grid_z>0; absent => uniform y.
+        if (vertical_axis == 2) then
+            grdfile = trim(loc) // "grid_z.out"
+            inquire(file=trim(grdfile), exist=fexists)
+            if (fexists) then
+                if (allocated(grid_z8)) deallocate(grid_z8)
+                allocate(grid_z8(npoints(2),5))
+                open(newunit=unit, file=grdfile, status='old', action='read', iostat=filerr)
+                if (filerr /= 0) error stop "Error opening grid_z.out"
+                do ii = 1, npoints(2)
+                    read(unit,*,iostat=filerr) (grid_z8(ii,jj), jj=1,5)
+                    if (filerr /= 0) error stop "Error reading grid_z.out"
+                end do
+                close(unit)
+                yin_p = origin(2) + grid_z8(:,2)
+                yin_f = origin(2) + grid_z8(:,3)
+                dyv   = 2.0_dp * (yin_f - yin_p)     ! cell width (centres are face midpoints)
+                y_stretched = .true.
+                deallocate(grid_z8)
+                if (procid == 0) print *, "*** Read stretched spanwise grid from grid_z.out ***"
             end if
         end if
 
@@ -459,6 +489,100 @@ contains
         end if
     end subroutine parse_vertex_normal_pair
 
+    ! Load geometry for one or more solids, tagging every face with its owning solid ID.
+    subroutine load_multi_object_geometry(procid, filename, vertices, normals, faces, face_normals, &
+                                          face_solid_id, num_vertices, num_normals, num_faces, num_solids)
+        ! `filename` is a single .stl/.obj file (solid ID 1) or a `.list` manifest (one path per line, 1-based order is the solid ID).
+        implicit none
+        integer,  intent(in)  :: procid
+        character(len=*), intent(in) :: filename
+        real(dp), allocatable, intent(out) :: vertices(:,:), normals(:,:)
+        integer,  allocatable, intent(out) :: faces(:,:), face_normals(:,:)
+        integer,  allocatable, intent(out) :: face_solid_id(:)
+        integer,  intent(out) :: num_vertices, num_normals, num_faces, num_solids
+
+        character(len=512), allocatable :: manifest(:)
+        real(dp), allocatable :: v_i(:,:), n_i(:,:)
+        integer,  allocatable :: f_i(:,:), fn_i(:,:)
+        integer :: nv_i, nn_i, nf_i
+        integer :: solid, unit, ios, nlines
+        character(len=512) :: line, aline
+        character(len=4)   :: ext
+        integer :: ii, pos, vbase, nbase, fbase
+
+        ii = len_trim(filename)
+        ext = filename(max(1,ii-3):ii)
+
+        if (ext == '.lst' .or. filename(max(1,ii-4):ii) == '.list') then
+            ! Count manifest entries first
+            open(newunit=unit, file=trim(filename), status='old', action='read', iostat=ios)
+            if (ios /= 0) then
+                print *, 'Error opening manifest file: ', trim(filename); stop
+            end if
+            nlines = 0
+            do
+                read(unit,'(A)',iostat=ios) line
+                if (ios /= 0) exit
+                aline = adjustl(line)
+                pos = verify(aline, ' ')
+                if (pos == 0 .or. aline(pos:pos) == '#') cycle
+                nlines = nlines + 1
+            end do
+            rewind(unit)
+            allocate(manifest(nlines))
+            nlines = 0
+            do
+                read(unit,'(A)',iostat=ios) line
+                if (ios /= 0) exit
+                aline = adjustl(line)
+                pos = verify(aline, ' ')
+                if (pos == 0 .or. aline(pos:pos) == '#') cycle
+                nlines = nlines + 1
+                manifest(nlines) = trim(aline)
+            end do
+            close(unit)
+            if (nlines == 0) then
+                if (procid == 0) print *, 'Error: geometry manifest contains no geometry paths: ', trim(filename)
+                error stop
+            end if
+        else
+            allocate(manifest(1))
+            manifest(1) = trim(filename)
+        end if
+
+        num_solids   = size(manifest)
+        num_vertices = 0; num_normals = 0; num_faces = 0
+        allocate(vertices(3,0), normals(3,0), faces(3,0), face_normals(3,0), face_solid_id(0))
+
+        do solid = 1, num_solids
+            ii = len_trim(manifest(solid))
+            ext = manifest(solid)(max(1,ii-3):ii)
+            if (ext == '.stl' .or. ext == '.STL') then
+                call read_stl_binary(procid, trim(manifest(solid)), v_i, n_i, f_i, fn_i, nv_i, nn_i, nf_i)
+            else
+                call read_obj(procid, trim(manifest(solid)), v_i, n_i, f_i, fn_i, nv_i, nn_i, nf_i)
+            end if
+
+            vbase = num_vertices; nbase = num_normals; fbase = num_faces
+
+            vertices     = reshape([vertices, v_i],           [3, vbase + nv_i])
+            normals      = reshape([normals,  n_i],            [3, nbase + nn_i])
+            faces        = reshape([faces,    f_i + vbase],    [3, fbase + nf_i])
+            face_normals = reshape([face_normals, fn_i + nbase], [3, fbase + nf_i])
+            face_solid_id = [face_solid_id, spread(solid, 1, nf_i)]
+
+            num_vertices = vbase + nv_i
+            num_normals  = nbase + nn_i
+            num_faces    = fbase + nf_i
+
+            deallocate(v_i, n_i, f_i, fn_i)
+        end do
+
+        if (procid == 0) then
+            print *, 'Loaded ', num_solids, ' solid(s), total faces: ', num_faces
+        end if
+    end subroutine load_multi_object_geometry
+
     ! Get axis-aligned bounding box of the geometry
     subroutine getbbox(procid, vertices_in, num_vertices_in, bbox_min, bbox_max)
         implicit none
@@ -476,6 +600,74 @@ contains
             print *, "Geometry bbox max:", bbox_max
         end if
     end subroutine getbbox
+
+    ! Warn about solids that are too small, in any direction, relative to the local grid
+    ! spacing to be reliably captured. A solid narrower than ~2 cells may contain no
+    ! grid sample, making its interior impossible to classify on this grid.
+    subroutine check_object_resolution(procid, vertices, faces, face_solid_id, nfaces, nsolids)
+        implicit none
+        integer,  intent(in) :: procid, nfaces, nsolids
+        real(dp), intent(in) :: vertices(:,:)
+        integer,  intent(in) :: faces(:,:)
+        integer,  intent(in) :: face_solid_id(:)
+        real(dp), allocatable :: smin(:,:), smax(:,:)
+        logical,  allocatable :: seen(:)
+        integer  :: fi, sid, vi, vidx, d, kk
+        real(dp) :: extent(3), local_dz, local_dy, min_cells
+        real(dp), parameter :: MIN_CELLS_OK = 2.0_dp
+
+        if (procid /= 0) return
+
+        allocate(smin(3,nsolids), smax(3,nsolids), seen(nsolids))
+        seen = .false.
+
+        do fi = 1, nfaces
+            sid = face_solid_id(fi)
+            do vi = 1, 3
+                vidx = faces(vi,fi)
+                if (.not. seen(sid)) then
+                    smin(:,sid) = vertices(:,vidx)
+                    smax(:,sid) = vertices(:,vidx)
+                    seen(sid)   = .true.
+                else
+                    do d = 1, 3
+                        if (vertices(d,vidx) < smin(d,sid)) smin(d,sid) = vertices(d,vidx)
+                        if (vertices(d,vidx) > smax(d,sid)) smax(d,sid) = vertices(d,vidx)
+                    end do
+                end if
+            end do
+        end do
+
+        do sid = 1, nsolids
+            if (.not. seen(sid)) cycle
+            extent = smax(:,sid) - smin(:,sid)
+
+            ! Coarsest local z spacing spanned by this solid (dz may be non-uniform);
+            ! conservative on purpose so a stretched region isn't reported as resolved
+            ! just because the grid is fine somewhere else in the domain.
+            local_dz = dz(1)
+            do kk = 1, size(zp)
+                if (zp(kk) >= smin(3,sid) - dz(kk) .and. zp(kk) <= smax(3,sid) + dz(kk)) &
+                    local_dz = max(local_dz, dz(kk))
+            end do
+
+            local_dy = dyv(1)
+            do kk = 1, size(yp)
+                if (yp(kk) >= smin(2,sid) - dyv(kk) .and. yp(kk) <= smax(2,sid) + dyv(kk)) &
+                    local_dy = max(local_dy, dyv(kk))
+            end do
+
+            min_cells = min(extent(1)/dx, extent(2)/local_dy, extent(3)/local_dz)
+            if (min_cells < MIN_CELLS_OK) then
+                print '(A,I0,A,F6.2,A)', 'WARNING: solid ', sid, &
+                    ' spans only ', min_cells, &
+                    ' grid cells in its narrowest direction — below reliable SDF ' // &
+                    'resolution (need >= 2); it may be dropped or misrepresented.'
+            end if
+        end do
+
+        deallocate(smin, smax, seen)
+    end subroutine check_object_resolution
 
     ! Tag grid points inside bounding box (with buffer) for focused SDF computation
     subroutine tagminmax(procid, xin, yin, zin, bbox_min, bbox_max, &

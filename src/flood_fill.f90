@@ -39,12 +39,14 @@ contains
         ! Pass 1: BFS from domain boundary through sentinel cells -> EXTERIOR
         !
         ! Only seed exterior from AABB faces that lie strictly inside the physical
-        ! domain (the buffer zone). When an AABB face coincides with the physical
-        ! domain boundary, the geometry may be cut there, so those cells never get
-        ! a narrowband value and remain at +scalarvalue. Seeding them as exterior
-        ! would let the BFS leak through the open cut face. Truly exterior cells on
-        ! those clamped faces are still reached by BFS propagation from the
-        ! buffer-zone seeds on the other faces.
+        ! domain (the buffer zone).  When an AABB face coincides with the physical
+        ! domain boundary (sx==1, ey==iny, etc.) the geometry may be cut there:
+        ! the solid's clipped face is outside the AABB so those cells never get a
+        ! narrowband value and remain at +scalarvalue.  Seeding them as exterior
+        ! would cause the BFS to leak through the open cut face and incorrectly
+        ! classify the entire interior of the cut solid as exterior.
+        ! Truly exterior cells on those clamped faces are reached by BFS propagation
+        ! from the buffer-zone seeds on the other faces.
         !
         top = 0
         do kk = sz, ez; do jj = sy, ey; do ii = sx, ex
@@ -91,10 +93,11 @@ contains
         end do
 
         !
-        ! Pass 2: any sentinel cell not reached by the exterior BFS is enclosed
-        ! by the narrowband surface, hence interior. This does not depend on the
-        ! sign of narrowband values, so it is robust to inconsistent surface
-        ! normals.
+        ! Pass 2: topology-based interior classification.
+        ! Any sentinel cell not reached by the exterior BFS (flag still 0) is
+        ! enclosed by the narrowband surface and is therefore interior.  This
+        ! does NOT use the sign of narrowband values, so it is robust to
+        ! geometries whose surface normals are inverted or inconsistent.
         !
         do kk = sz, ez; do jj = sy, ey; do ii = sx, ex
             if (flag(ii,jj,kk) == 0 .and. &

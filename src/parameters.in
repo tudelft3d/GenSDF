@@ -1,16 +1,16 @@
-# Name and location of the input geometry (OBJ or binary STL, detected by extension)
-'data/geometry.obj'
+# Geometry: one OBJ/STL file or a .list manifest (paths relative to the run directory)
+'data/armadillo_withnormals.obj'
 # Scalar default value (real), narrow-band buffer_points (int), progress bar width (int)
 1d10  8  40
-# Grid dimensions nx, ny, nz (interior cell-centres, matching geometry.out)
-512 512 512
+# Grid dimensions nx, ny, nz (must match data/geometry.out)
+512 128 128
 # Grid origin r0(1) r0(2) r0(3)
 0.0 0.0 0.0
-# Non-uniform z grid (.true. reads data/grid.out, .false. uses uniform spacing)
+# Stretched wall-normal grid (.true. reads data/grid.out)
+.false.
+# Use hash-seeded Fast Sweeping (.true.) or brute-force initialization (.false.)
 .true.
-# Use fast-sweep algorithm (.true. = narrow-band + FSM; .false. = original brute-force)
-.true.
-# Narrow-band width in cells (must be >= n_image_layers + 2 = 4 for dopamine IBM)
+# narrow_band_width (retained for input compatibility; currently not a cutoff)
 8
 # Vertical (wall-normal) axis of the solver (2 = y-vertical, 3 = z-vertical)
 3
