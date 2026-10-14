@@ -1,0 +1,19 @@
+# Geometry: one OBJ/STL file or a .list manifest (paths relative to the run directory)
+'data/armadillo_withnormals.obj'
+# Scalar default value (real), narrow-band buffer_points (int), progress bar width (int)
+1d10  8  40
+# Grid dimensions nx, ny, nz (must match data/geometry.out)
+512 128 128
+# Grid origin r0(1) r0(2) r0(3)
+0.0 0.0 0.0
+# Stretched wall-normal grid (.true. reads data/grid.out)
+.false.
+# Use hash-seeded Fast Sweeping (.true.) or brute-force initialization (.false.)
+.true.
+# narrow_band_width (retained for input compatibility; currently not a cutoff)
+8
+# Vertical (wall-normal) axis of the solver (2 = y-vertical, 3 = z-vertical)
+3
+# Compute face-staggered SDFs (sdfu, sdfv, sdfw) in addition to cell-centre sdfp
+# (.false. = cell-centre only; .true. = all four SDFs)
+.false.

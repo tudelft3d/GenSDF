@@ -1,0 +1,44 @@
+<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>
+<Xdmf Version="2.0">
+  <Domain>
+    <!-- Topology describes the mesh (grid structure). -->
+    <!-- Dimensions order is K J I (slowest→fastest), matching Fortran column-major layout.   -->
+    <!-- sdfp.bin is written as padded(nx+2, nz+2, ny) so I=nx+2=514, J=nz+2=130, K=ny=128. -->
+    <Topology TopologyType="3DCoRectMesh" Dimensions="128 130 514" />
+
+    <!-- Geometry defines the origin and spacing of the grid. -->
+    <Geometry GeometryType="ORIGIN_DXDYDZ">
+      <!-- Origin: Starting coordinates of the grid -->
+      <DataItem Format="XML" Dimensions="3">
+        0.0 0.0 0.0  <!-- Replace with the actual coordinates of your origin -->
+      </DataItem>
+      <!-- Spacing: Grid point spacing along each axis -->
+      <DataItem Format="XML" Dimensions="3">
+        0.0625 0.0625 0.0625  <!-- Replace with the actual spacing along X, Y, and Z axes -->
+      </DataItem>
+    </Geometry>
+
+    <!-- Grid refers to time-varying data (optional). -->
+    <Grid Name="TimeSeries" GridType="Collection" CollectionType="Temporal">
+      <!-- Time description -->
+      <Time TimeType="List">
+        <DataItem Format="XML" Dimensions="1">
+          0.0
+        </DataItem>
+      </Time>
+
+      <!-- Uniform Grid for each time step (in this case, just one step). -->
+      <Grid Name="Timestep_0" GridType="Uniform">
+        <Topology Reference="/Xdmf/Domain/Topology" />
+        <Geometry Reference="/Xdmf/Domain/Geometry" />
+
+        <!-- Scalar field stored at each grid point (your binary data) -->
+        <Attribute Name="SDF" AttributeType="Scalar" Center="Node">
+          <DataItem Format="Binary" DataType="Float" Precision="8" Endian="Big" Dimensions="128 130 514" Seek="0">
+            sdfp.bin
+          </DataItem>
+        </Attribute>
+      </Grid>
+    </Grid>
+  </Domain>
+</Xdmf>

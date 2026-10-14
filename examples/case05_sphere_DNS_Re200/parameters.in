@@ -1,0 +1,28 @@
+# GenSDF control file — solver Example 05
+# Flow around a sphere — DNS, Re_D = 200
+#
+# Run as:  bash run.sh [N]   (N defaults to 4; one rank is also supported)
+# Output:  data/sdfu.bin  data/sdfv.bin  data/sdfw.bin  data/sdfp.bin
+#          (SDF at staggered U/V/W faces and cell centres)
+#
+# The cell-centre SDF (data/sdfp.bin) must be renamed 'SDF_in' in the
+# solver run directory and ibm_sdf_input = 1 set in input_parameters.
+
+# Geometry filename (OBJ or binary STL, detected by extension)
+'data/sphere.stl'
+# scalarvalue  buffer_points  pbarwidth
+1d10  5  40
+# Grid dimensions nx ny nz (cell-centre counts = nxm, nym, nzm; matching geometry.out)
+255 127 127
+# Domain origin r0(1) r0(2) r0(3)
+0.0 0.0 0.0
+# Non-uniform z grid (.false. = uniform Cartesian)
+.false.
+# Use fast-sweep algorithm (.true. = narrow-band + FSM)
+.true.
+# narrow_band_width (retained for input compatibility; currently not a cutoff)
+5
+# Vertical (wall-normal) axis of the solver (2 = y-vertical, 3 = z-vertical)
+2
+# Compute face-staggered SDFs (sdfu, sdfv, sdfw) in addition to cell-centre sdfp
+.true.
