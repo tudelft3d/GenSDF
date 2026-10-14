@@ -345,20 +345,3 @@ Associated manuscript: [SoftwareX article](https://www.sciencedirect.com/science
 
 Contributors: Akshay and Udhaya Chandiran.
 
-## Manually publishing this guide to the GitHub Wiki
-
-Run `./scripts/sync-wiki.sh` from a checkout of the branch whose documentation
-you want to publish. The script clones the wiki using the same HTTPS or SSH
-transport as the checkout's `origin`, copies this guide to the wiki's
-`Home.md`, updates repository links from `main` to the checked-out branch,
-then commits and pushes the change. It only updates `Home.md`; other wiki
-pages are left unchanged.
-
-The wiki must be enabled and initialized with its first page. Configure Git
-credentials with wiki write access before running the script. For SSH, the
-SSH key used for the source repository must also have wiki write access. For
-HTTPS, use a credential helper or another secure Git credential mechanism;
-do not put a personal access token in the script or its URL. Configure
-`git user.name` and `git user.email` so the script can create the wiki commit.
-If the checkout is in detached-HEAD state, check out the desired branch
-before running.

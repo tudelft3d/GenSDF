@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! repo_root="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "Error: sync-wiki.sh must be inside a Git checkout." >&2
+  exit 1
+fi
 remote_url="$(git -C "$repo_root" remote get-url origin)"
 source_branch="$(git -C "$repo_root" branch --show-current)"
 
